@@ -54,11 +54,18 @@ UPSTOX_HDRS   = {
 
 # ── Bot Settings ──────────────────────────────────────
 ZONE_NEAR_PTS       = int(os.getenv("ZONE_NEAR_POINTS",    "25"))
-WAIT_COOLDOWN_MIN   = int(os.getenv("WAIT_COOLDOWN_MIN",   "15"))
+WAIT_COOLDOWN_MIN   = int(os.getenv("WAIT_COOLDOWN_MIN",   "25"))
 SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "30"))
 MAX_ZONES           = int(os.getenv("MAX_ZONES",           "12"))
 MAX_AI_RAW_LOG      = int(os.getenv("MAX_AI_RAW_LOG",     "100"))
 MIN_CONFIRMATIONS   = int(os.getenv("MIN_CONFIRMATIONS",    "2"))
+
+# ── Candle Trigger Engine Constants ───────────────────
+ZONE_TOUCH_BUFFER    = int(os.getenv("ZONE_TOUCH_BUFFER",   "12"))
+SIDEWAYS_CANDLE_CNT  = int(os.getenv("SIDEWAYS_CANDLE_CNT",  "4"))
+SIDEWAYS_MAX_RANGE   = int(os.getenv("SIDEWAYS_MAX_RANGE",  "30"))
+BREAKOUT_BUFFER      = int(os.getenv("BREAKOUT_BUFFER",     "10"))
+LAST_AI_CALL_MINUTE  = int(os.getenv("LAST_AI_CALL_MINUTE",  "5"))
 
 # ── AI Model ─────────────────────────────────────────
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
@@ -444,11 +451,18 @@ def zone_cooldown_ok(zone_id):
     key = f"cooldown_{zone_id}"
     cd  = _get(key)
     if cd:
-        until = datetime.fromisoformat(cd["until"])
-        if datetime.now(IST) < until:
-            rem = int((until - datetime.now(IST)).total_seconds() / 60)
-            log.info(f"Zone {zone_id} cooldown: {rem}min left")
-            return False
+        try:
+            until = datetime.fromisoformat(cd["until"])
+            # Ensure timezone aware for comparison
+            if until.tzinfo is None:
+                until = IST.localize(until)
+            now = datetime.now(IST)
+            if now < until:
+                rem = int((until - now).total_seconds() / 60)
+                log.info(f"Zone {zone_id} cooldown: {rem}min left")
+                return False
+        except Exception as e:
+            log.warning(f"Cooldown parse error for {zone_id}: {e}")
     return True
 
 
@@ -465,8 +479,10 @@ def mark_zone_cooldown(zone_id, signal_type):
 # Zone merge — hourly reanalysis
 def merge_zones(existing, new_zones, ltp):
     """
-    Merge new zones into existing:
-    - 50% overlap → replace
+    Merge new zones into existing.
+    Rules:
+    - FLIP_ zones are preserved (don't overwrite with AI's original type)
+    - 50% overlap with non-flip zone → replace
     - No overlap → add
     - Too far from LTP (>500 pts) → drop
     - Max MAX_ZONES zones
@@ -476,22 +492,37 @@ def merge_zones(existing, new_zones, ltp):
         span_a = max(a["high"] - a["low"], 1)
         return ol / span_a
 
-    result = list(existing)
+    # Separate flipped zones — preserve them always
+    flipped   = [z for z in existing if z.get("type","").startswith("FLIP_")]
+    non_flip  = [z for z in existing if not z.get("type","").startswith("FLIP_")]
+
+    result = list(non_flip)
     for nz in new_zones:
         if abs((nz["low"] + nz["high"]) / 2 - ltp) > 500:
             continue  # too far
 
+        # Don't overwrite a flipped zone with AI's old type
+        skip = False
+        for fz in flipped:
+            if overlap(fz, nz) >= 0.5:
+                skip = True
+                break
+        if skip:
+            continue
+
         replaced = False
         for i, ez in enumerate(result):
             if overlap(ez, nz) >= 0.5:
-                result[i] = nz  # replace with fresh zone
+                result[i] = nz
                 replaced = True
                 break
-
         if not replaced:
             result.append(nz)
 
-    # Keep max zones, prefer closer to LTP
+    # Add back flipped zones
+    result.extend(flipped)
+
+    # Sort by distance from LTP, keep max
     result.sort(key=lambda z: abs((z["low"] + z["high"]) / 2 - ltp))
     return result[:MAX_ZONES]
 
@@ -531,6 +562,263 @@ def track_open_signals(ltp):
 # ═══════════════════════════════════════════════════════
 # SECTION 5: AI CALLS (Haiku)
 # ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════
+# SECTION 4.5: CANDLE TRIGGER ENGINE
+# ═══════════════════════════════════════════════════════
+
+def _to_ist_datetime(ts):
+    """Convert any timestamp to IST-aware datetime"""
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return IST.localize(ts.to_pydatetime())
+    return ts.tz_convert(IST).to_pydatetime()
+
+
+def get_last_completed_m5_candle(tf_data, buffer_seconds=10):
+    """
+    Return last COMPLETED 5min candle.
+    If latest candle still forming → use previous one.
+    9:25 candle completes at 9:30:10 (5min + 10sec buffer)
+    """
+    m5 = tf_data.get("m5", pd.DataFrame())
+    if m5.empty:
+        return None
+
+    now         = datetime.now(IST)
+    last        = m5.iloc[-1]
+    last_ts     = _to_ist_datetime(last["ts"])
+    complete_at = last_ts + timedelta(minutes=5, seconds=buffer_seconds)
+
+    if now >= complete_at:
+        return last
+
+    if len(m5) >= 2:
+        prev    = m5.iloc[-2]
+        prev_ts = _to_ist_datetime(prev["ts"])
+        log.info(
+            f"5M candle {last_ts.strftime('%H:%M')} still forming "
+            f"→ using {prev_ts.strftime('%H:%M')}"
+        )
+        return prev
+
+    return None
+
+def detect_candle_event(tf_data, zone):
+    """
+    Detect what type of candle event is happening at this zone.
+    Returns: (event_name, event_detail)
+
+    Events:
+    BREAKOUT_CANDLE        → Close above resistance + buffer
+    BREAKDOWN_CANDLE       → Close below support + buffer
+    BULLISH_SWEEP_RECLAIM  → Wick below support, close back above
+    BEARISH_SWEEP_REJECT   → Wick above resistance, close back below
+    SUPPORT_REJECTION      → Bullish candle at support zone
+    RESISTANCE_REJECTION   → Bearish candle at resistance zone
+    COMPRESSION_BREAKOUT   → Tight 4-candle range then breakout
+    RETEST_HOLD            → Flip zone being retested + holding
+    NO_EVENT               → No clear setup — skip AI
+    """
+    try:
+        m5 = drop_incomplete_candle(
+            tf_data.get("m5", pd.DataFrame()), 5
+        )
+        if m5.empty or len(m5) < 5:
+            return "NO_EVENT", "insufficient 5M data"
+
+        candle = get_last_completed_m5_candle({"m5": m5})
+        if candle is None:
+            return "NO_EVENT", "no completed candle"
+
+        o = int(candle["o"])
+        h = int(candle["h"])
+        l = int(candle["l"])
+        c = int(candle["c"])
+
+        zone_low  = zone.get("low",  0)
+        zone_high = zone.get("high", 0)
+        zone_type = zone.get("type", "")
+
+        body        = c - o
+        candle_rng  = h - l
+        upper_wick  = h - max(o, c)
+        lower_wick  = min(o, c) - l
+
+        # ── 1. BREAKOUT: Close above resistance + buffer ──
+        if c > zone_high + BREAKOUT_BUFFER:
+            if zone_type in ["RESISTANCE", "FLIP_RESISTANCE", "LIQUIDITY"]:
+                return (
+                    "BREAKOUT_CANDLE",
+                    f"close {c} > zone_high {zone_high}+{BREAKOUT_BUFFER}"
+                )
+
+        # ── 2. BREAKDOWN: Close below support + buffer ────
+        if c < zone_low - BREAKOUT_BUFFER:
+            if zone_type in ["SUPPORT", "FLIP_SUPPORT", "LIQUIDITY"]:
+                return (
+                    "BREAKDOWN_CANDLE",
+                    f"close {c} < zone_low {zone_low}-{BREAKOUT_BUFFER}"
+                )
+
+        # ── 3. BULLISH SWEEP RECLAIM ──────────────────────
+        # Wick below zone, close back above zone_low
+        if l < zone_low - 5 and c > zone_low:
+            return (
+                "BULLISH_SWEEP_RECLAIM",
+                f"wick swept to {l} below {zone_low}, reclaimed to {c}"
+            )
+
+        # ── 4. BEARISH SWEEP REJECT ───────────────────────
+        # Wick above zone, close back below zone_high
+        if h > zone_high + 5 and c < zone_high:
+            return (
+                "BEARISH_SWEEP_REJECT",
+                f"wick swept to {h} above {zone_high}, rejected to {c}"
+            )
+
+        # ── 5. COMPRESSION BREAKOUT / BREAKDOWN ───────────
+        if len(m5) >= SIDEWAYS_CANDLE_CNT + 1:
+            prev = m5.iloc[-(SIDEWAYS_CANDLE_CNT + 1):-1]
+            h4   = int(prev["h"].max())
+            l4   = int(prev["l"].min())
+            rng4 = h4 - l4
+            if rng4 <= SIDEWAYS_MAX_RANGE:
+                if c > h4 + BREAKOUT_BUFFER:
+                    return (
+                        "COMPRESSION_BREAKOUT",
+                        f"4-candle range {rng4}pts → breakout close {c} above {h4}"
+                    )
+                if c < l4 - BREAKOUT_BUFFER:
+                    return (
+                        "COMPRESSION_BREAKDOWN",
+                        f"4-candle range {rng4}pts → breakdown close {c} below {l4}"
+                    )
+
+        # ── 6. SUPPORT REJECTION ──────────────────────────
+        if zone_type in ["SUPPORT", "FLIP_SUPPORT", "LIQUIDITY"]:
+            bullish_body  = body > 0
+            good_wick     = lower_wick > candle_rng * 0.25 if candle_rng > 0 else False
+            close_holds   = c > zone_low + 5
+
+            if close_holds and (bullish_body or good_wick):
+                return (
+                    "SUPPORT_REJECTION",
+                    f"bullish at support: body={body} lower_wick={lower_wick} close={c}"
+                )
+
+        # ── 7. RESISTANCE REJECTION ───────────────────────
+        if zone_type in ["RESISTANCE", "FLIP_RESISTANCE"]:
+            bearish_body = body < 0
+            good_wick    = upper_wick > candle_rng * 0.25 if candle_rng > 0 else False
+            close_below  = c < zone_high - 5
+
+            if close_below and (bearish_body or good_wick):
+                return (
+                    "RESISTANCE_REJECTION",
+                    f"bearish at resistance: body={body} upper_wick={upper_wick} close={c}"
+                )
+
+        # ── 8. RETEST HOLD (flip zone) ────────────────────
+        if zone_type == "FLIP_SUPPORT" and c > zone_low and body > 0:
+            return (
+                "RETEST_HOLD",
+                f"flip support retest: bullish close {c} above {zone_low}"
+            )
+        if zone_type == "FLIP_RESISTANCE" and c < zone_high and body < 0:
+            return (
+                "RETEST_HOLD",
+                f"flip resistance retest: bearish close {c} below {zone_high}"
+            )
+
+        return "NO_EVENT", f"zone touched but no clear candle event (body={body})"
+
+    except Exception as e:
+        log.error(f"detect_candle_event error: {e}")
+        return "NO_EVENT", f"error: {e}"
+
+
+def maybe_flip_zone(zone, event):
+    """
+    After breakout/breakdown, flip zone type dynamically.
+    RESISTANCE → FLIP_SUPPORT after BREAKOUT_CANDLE
+    SUPPORT    → FLIP_RESISTANCE after BREAKDOWN_CANDLE
+    """
+    z = dict(zone)
+    if event == "BREAKOUT_CANDLE" and z.get("type") == "RESISTANCE":
+        z["type"]             = "FLIP_SUPPORT"
+        z["preferred_action"] = "BUY_CE"
+        z["why"]              = f"[FLIPPED→SUPPORT] {z.get('why','')}"
+        log.info(f"Zone {z.get('id')} flipped: RESISTANCE → FLIP_SUPPORT")
+
+    elif event == "BREAKDOWN_CANDLE" and z.get("type") == "SUPPORT":
+        z["type"]             = "FLIP_RESISTANCE"
+        z["preferred_action"] = "BUY_PE"
+        z["why"]              = f"[FLIPPED→RESISTANCE] {z.get('why','')}"
+        log.info(f"Zone {z.get('id')} flipped: SUPPORT → FLIP_RESISTANCE")
+
+    return z
+
+
+# ── Prompt Modules — one per situation ───────────────
+PROMPT_MODULES = {
+    "SUPPORT_REJECTION": (
+        "SITUATION: SUPPORT_REJECTION — Price at support, bullish candle visible. "
+        "Check: genuine bounce or weak close before further drop? "
+        "BUY_CE if strong bullish rejection confirmed. WAIT if weak."
+    ),
+    "RESISTANCE_REJECTION": (
+        "SITUATION: RESISTANCE_REJECTION — Price at resistance, bearish candle visible. "
+        "Check: genuine rejection or fakeout before breakout? "
+        "BUY_PE if strong bearish rejection. WAIT if weak."
+    ),
+    "BREAKOUT_CANDLE": (
+        "SITUATION: BREAKOUT_CANDLE — Price closed ABOVE resistance with momentum. "
+        "This is a potential breakout continuation. "
+        "BUY_CE if breakout is strong and body is big. "
+        "WAIT if candle is small/suspicious or if immediate resistance is overhead. "
+        "Do NOT return BUY_PE on a breakout candle unless clear trap signal."
+    ),
+    "BREAKDOWN_CANDLE": (
+        "SITUATION: BREAKDOWN_CANDLE — Price closed BELOW support with momentum. "
+        "Potential breakdown continuation. "
+        "BUY_PE if breakdown is strong. WAIT if weak/possible trap. "
+        "Do NOT return BUY_CE on a breakdown candle."
+    ),
+    "BULLISH_SWEEP_RECLAIM": (
+        "SITUATION: BULLISH_SWEEP_RECLAIM / CHoCH — Price swept BELOW support then "
+        "closed back above zone. Classic liquidity sweep + reclaim. "
+        "BUY_CE if last 5M close is strong above zone AND higher low forming. "
+        "WAIT if close is weak or no structural break yet."
+    ),
+    "BEARISH_SWEEP_REJECT": (
+        "SITUATION: BEARISH_SWEEP_REJECT / CHoCH — Price swept ABOVE resistance then "
+        "closed back below zone. Classic trap rejection. "
+        "BUY_PE if close is strong below zone AND lower high forming. "
+        "WAIT if close is weak."
+    ),
+    "COMPRESSION_BREAKOUT": (
+        "SITUATION: COMPRESSION_BREAKOUT — Last 4 candles tight range (<30pts), "
+        "now breaking out. "
+        "BUY_CE if breaking upside and aligned with bias. "
+        "BUY_PE if breaking downside and aligned with bias. "
+        "WAIT if direction unclear or volume/body weak."
+    ),
+    "COMPRESSION_BREAKDOWN": (
+        "SITUATION: COMPRESSION_BREAKDOWN — Last 4 candles tight range (<30pts), "
+        "now breaking down. "
+        "BUY_PE if breakdown is clean and aligned with bias. "
+        "WAIT if uncertain."
+    ),
+    "RETEST_HOLD": (
+        "SITUATION: RETEST_HOLD — Previously broken level (flip zone) being retested. "
+        "Price returned to broken zone and is holding. "
+        "BUY_CE if flip support holding (bullish close above zone). "
+        "BUY_PE if flip resistance holding (bearish close below zone). "
+        "This is a high-quality setup if confirmed."
+    ),
+}
+
 
 FIRST_ANALYSIS_SYSTEM = """You are an expert NIFTY50 price-action zone analyst.
 The user manually confirms every trade. This is NOT auto-trading.
@@ -686,15 +974,26 @@ RETURN ONLY this JSON:
     return result
 
 
-def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx):
-    """Run zone touch AI decision"""
-    log.info(f"🎯 Zone decision: {touched_zone.get('id')} @ LTP:{ltp}")
+def run_zone_decision(tf_data, ltp, touched_zone, all_zones, morning_ctx, event="", event_reason=""):
+    """Run zone touch AI decision — uses prompt router based on event"""
+    log.info(f"🎯 Zone decision: {touched_zone.get('id')} @ LTP:{ltp} | Event:{event}")
 
     data_str = build_zone_decision_string(
         tf_data, ltp, touched_zone, all_zones, morning_ctx
     )
 
-    user_prompt = data_str + """
+    # Add detected event context to user prompt
+    event_block = ""
+    if event and event != "NO_EVENT":
+        event_block = f"\n\n[DETECTED CANDLE EVENT]\nEvent: {event}\nDetail: {event_reason}"
+
+    # Prompt router — base + situation module
+    situation_module = PROMPT_MODULES.get(event, "")
+    system_prompt    = ZONE_DECISION_SYSTEM
+    if situation_module:
+        system_prompt += f"\n\n{situation_module}"
+
+    user_prompt = data_str + event_block + """
 
 RETURN ONLY this JSON:
 {
@@ -716,12 +1015,13 @@ RETURN ONLY this JSON:
   }
 }"""
 
-    raw    = call_haiku(ZONE_DECISION_SYSTEM, user_prompt)
+    raw    = call_haiku(system_prompt, user_prompt)
     result = parse_json(raw)
 
     save_ai_raw_log({
         "time":    datetime.now(IST).strftime("%H:%M"),
         "mode":    "ZONE_DECISION",
+        "event":   event,
         "zone_id": touched_zone.get("id"),
         "ltp":     ltp,
         "raw":     raw[:500] if raw else None,
@@ -991,22 +1291,44 @@ def hourly_job():
 
 
 def zone_monitor_job():
-    """Every 5:10 — Check if LTP touches a saved zone"""
+    """
+    Every 5:10 IST — Zone monitor with candle trigger engine.
+
+    Flow:
+    1. Early exit checks (free)
+    2. LTP fetch + ref analytics
+    3. Zone touch check (free)
+    4. Skip NO_TRADE / SIDEWAYS zones
+    5. Fetch intraday data (5M+15M)
+    6. Detect candle event (free)
+    7. Skip if NO_EVENT — saves tokens!
+    8. Maybe flip zone (RESISTANCE → FLIP_SUPPORT etc.)
+    9. Cooldown check
+    10. AI call with prompt router
+    11. Validate + send
+    """
     if not is_market_open():
         return
 
-    now = datetime.now(IST)
-    if now.hour == 9 and now.minute < 25:
+    now    = datetime.now(IST)
+    hour   = now.hour
+    minute = now.minute
+
+    # Early exits
+    if hour == 9 and minute < 25:
+        return
+    if hour == 15 and minute > LAST_AI_CALL_MINUTE:
+        log.info(f"After 15:{LAST_AI_CALL_MINUTE:02d} — no more AI calls")
         return
 
     try:
-        # Track ref analytics (no AI)
+        # LTP + ref tracking
         ltp = get_ltp()
         if not ltp:
             return
         track_open_signals(ltp)
 
-        # Check morning context
+        # Morning context check
         morning_ctx = get_morning_context()
         if not morning_ctx:
             log.warning("No morning context — running first analysis")
@@ -1020,7 +1342,7 @@ def zone_monitor_job():
         # Zone touch check (FREE)
         zones = get_zones()
         if not zones:
-            log.info("No zones saved yet")
+            log.info("No zones saved")
             return
 
         touched = get_touched_zone(ltp, zones)
@@ -1028,17 +1350,51 @@ def zone_monitor_job():
             log.info("No zone touched")
             return
 
-        zone_id = touched.get("id", "?")
-        log.info(f"🎯 Zone touched: {zone_id} ({touched.get('low')}-{touched.get('high')})")
+        zone_id   = touched.get("id", "?")
+        zone_type = touched.get("type", "")
+        log.info(f"🎯 Zone: {zone_id} ({touched.get('low')}-{touched.get('high')}) [{zone_type}]")
+
+        # Skip NO_TRADE and SIDEWAYS zones — no AI needed
+        if zone_type in ["NO_TRADE", "SIDEWAYS"]:
+            log.info(f"⏭️ Skipping {zone_type} zone — no AI call")
+            return
+
+        # Fetch intraday data (needed for event detection + AI)
+        tf_data = fetch_zone_decision_data()
+
+        # ── Candle Trigger Engine ─────────────────────────
+        event, event_reason = detect_candle_event(tf_data, touched)
+        log.info(f"📊 Candle event: {event} | {event_reason}")
+
+        # No clear candle event → skip AI, save tokens
+        if event == "NO_EVENT":
+            log.info("⏭️ No candle event — skipping AI call")
+            return
+
+        # ── Zone flip (RESISTANCE → FLIP_SUPPORT etc.) ───
+        updated_zone = maybe_flip_zone(touched, event)
+        if updated_zone["type"] != touched["type"]:
+            # Save flipped zone back to Redis
+            updated_zones = [
+                updated_zone if z.get("id") == zone_id else z
+                for z in zones
+            ]
+            save_zones(updated_zones)
+            zones = updated_zones
+            tg_send(
+                f"🔄 Zone flipped: {zone_id}\n"
+                f"{touched['type']} → {updated_zone['type']}\n"
+                f"LTP: {ltp}"
+            )
 
         # Cooldown check
         if not zone_cooldown_ok(zone_id):
             return
 
-        # Fetch data + run AI
-        tf_data = fetch_zone_decision_data()
-        result  = run_zone_decision(
-            tf_data, ltp, touched, zones, morning_ctx
+        # ── AI Call with Prompt Router ────────────────────
+        result = run_zone_decision(
+            tf_data, ltp, updated_zone, zones,
+            morning_ctx, event, event_reason
         )
 
         if not result:
@@ -1047,8 +1403,8 @@ def zone_monitor_job():
         # Validate
         if not validate_decision(result, ltp):
             tg_send(
-                f"⚠️ Signal rejected: low confidence / weak confirmations\n"
-                f"Zone: {zone_id} | LTP: {ltp}"
+                f"⚠️ Signal rejected: low conf / weak confirmations\n"
+                f"Zone:{zone_id} | Event:{event} | LTP:{ltp}"
             )
             mark_zone_cooldown(zone_id, "WAIT")
             return
@@ -1063,6 +1419,7 @@ def zone_monitor_job():
         save_signal_log({
             "time":       now.strftime("%H:%M"),
             "zone_id":    zone_id,
+            "event":      event,
             "signal":     sig,
             "confidence": result.get("confidence"),
             "ref_sl":     ref.get("ref_sl", 0),
@@ -1071,15 +1428,26 @@ def zone_monitor_job():
         })
 
         # Send Telegram
-        send_signal(result, ltp, touched)
+        send_signal(result, ltp, updated_zone)
 
     except Exception as e:
         log.error(f"Zone monitor error: {e}")
 
 
 def closing_job():
-    """3:30 PM — EOD summary + flush"""
+    """3:30 PM — Mark open signals expired, EOD summary, flush"""
     log.info("🔔 CLOSING JOB")
+
+    # Mark all OPEN signals as EXPIRED before summary
+    history = get_signal_history()
+    changed = False
+    for s in history:
+        if s.get("result") == "OPEN":
+            s["result"] = "EOD_OPEN"
+            changed = True
+    if changed:
+        _set("signal_history", history)
+
     run_eod_summary()
     flush_day()
 
@@ -1110,30 +1478,20 @@ def main():
         f"Running first analysis now..."
     )
 
-    # Run first analysis immediately on start
-    # Works whether bot starts at 9:20 or 12:00
-    if is_market_open():
-        morning_job()
-
-    # ── Scheduler ────────────────────────────────────
+    # ── Scheduler — start BEFORE morning_job ─────────
     scheduler = BackgroundScheduler(timezone=IST)
 
-    # First analysis — 9:20 IST
     scheduler.add_job(
         morning_job, "cron",
         hour=9, minute=20, second=0,
         id="morning"
     )
-
-    # Hourly reanalysis — :02 of each hour
     scheduler.add_job(
         hourly_job, "cron",
         minute=2, second=0,
         hour="10,11,12,13,14",
         id="hourly"
     )
-
-    # Zone monitor — every 5 min at :10 sec
     scheduler.add_job(
         zone_monitor_job, "cron",
         minute="0,5,10,15,20,25,30,35,40,45,50,55",
@@ -1141,20 +1499,23 @@ def main():
         hour="9,10,11,12,13,14,15",
         id="zone_monitor"
     )
-
-    # EOD — 3:30 PM
     scheduler.add_job(
         closing_job, "cron",
         hour=15, minute=30, second=0,
         id="closing"
     )
 
-    scheduler.start()
+    scheduler.start()   # ← Pahile start
     log.info("✅ Scheduler started")
-    log.info("   First analysis : 9:20 IST")
+    log.info("   First analysis    : 9:20 IST")
     log.info("   Hourly reanalysis : :02 of each hour")
-    log.info("   Zone monitor : Every 5min :10sec")
-    log.info("   EOD summary : 15:30 IST")
+    log.info("   Zone monitor      : Every 5min :10sec")
+    log.info("   EOD summary       : 15:30 IST")
+
+    # ── First analysis on startup (after scheduler) ──
+    if is_market_open():
+        log.info("Market open → running first analysis now...")
+        morning_job()   # ← Scheduler already running, no warning
 
     # ── Flask ─────────────────────────────────────────
     flask_app = Flask(__name__)
