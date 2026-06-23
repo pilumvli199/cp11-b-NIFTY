@@ -437,12 +437,32 @@ def save_ai_raw_log(entry):
 
 # Zone touch check
 def get_touched_zone(ltp, zones):
-    """Return first zone where LTP is inside or within ZONE_NEAR_PTS"""
+    """
+    Return touched zone. Priority:
+    1. Non-NO_TRADE/SIDEWAYS zones first
+    2. NO_TRADE/SIDEWAYS only if nothing else touched
+    This prevents NO_TRADE from blocking overlapping actionable zones.
+    """
+    no_trade_types = ["NO_TRADE", "SIDEWAYS"]
+
+    # Pass 1: actionable zones first
     for z in zones:
-        low  = z.get("low", 0)
+        if z.get("type") in no_trade_types:
+            continue
+        low  = z.get("low",  0)
         high = z.get("high", 0)
         if (ltp >= low - ZONE_NEAR_PTS) and (ltp <= high + ZONE_NEAR_PTS):
             return z
+
+    # Pass 2: NO_TRADE only if no actionable zone found
+    for z in zones:
+        if z.get("type") not in no_trade_types:
+            continue
+        low  = z.get("low",  0)
+        high = z.get("high", 0)
+        if (ltp >= low - ZONE_NEAR_PTS) and (ltp <= high + ZONE_NEAR_PTS):
+            return z
+
     return None
 
 
@@ -640,6 +660,10 @@ def detect_candle_event(tf_data, zone):
         zone_high = zone.get("high", 0)
         zone_type = zone.get("type", "")
 
+        # Normalize FLIP type → price position decide karto
+        if zone_type == "FLIP":
+            zone_type = "FLIP_SUPPORT" if ltp >= zone_low else "FLIP_RESISTANCE"
+
         body        = c - o
         candle_rng  = h - l
         upper_wick  = h - max(o, c)
@@ -698,10 +722,12 @@ def detect_candle_event(tf_data, zone):
         # ── 6. SUPPORT REJECTION ──────────────────────────
         if zone_type in ["SUPPORT", "FLIP_SUPPORT", "LIQUIDITY"]:
             bullish_body  = body > 0
+            doji_body     = abs(body) <= 3           # doji at support is OK
             good_wick     = lower_wick > candle_rng * 0.25 if candle_rng > 0 else False
             close_holds   = c > zone_low + 5
+            not_bearish   = body >= -3               # reject clearly bearish bodies
 
-            if close_holds and (bullish_body or good_wick):
+            if close_holds and not_bearish and (bullish_body or (doji_body and good_wick)):
                 return (
                     "SUPPORT_REJECTION",
                     f"bullish at support: body={body} lower_wick={lower_wick} close={c}"
@@ -710,10 +736,12 @@ def detect_candle_event(tf_data, zone):
         # ── 7. RESISTANCE REJECTION ───────────────────────
         if zone_type in ["RESISTANCE", "FLIP_RESISTANCE"]:
             bearish_body = body < 0
+            doji_body    = abs(body) <= 3            # doji at resistance is OK
             good_wick    = upper_wick > candle_rng * 0.25 if candle_rng > 0 else False
             close_below  = c < zone_high - 5
+            not_bullish  = body <= 3                 # reject clearly bullish bodies
 
-            if close_below and (bearish_body or good_wick):
+            if close_below and not_bullish and (bearish_body or (doji_body and good_wick)):
                 return (
                     "RESISTANCE_REJECTION",
                     f"bearish at resistance: body={body} upper_wick={upper_wick} close={c}"
@@ -1361,9 +1389,9 @@ def hourly_job():
         now_str = datetime.now(IST).strftime("%H:%M")
         tg_send(
             f"🔄 <b>Zone Update | {now_str}</b>\n"
-            f"Bias:{result.get('bias')} | {len(merged)} zones active"
+            f"Bias:{result.get('bias')} | Structure:{result.get('structure')} | {len(merged)} zones active"
         )
-        log.info(f"✅ Hourly done: {len(merged)} zones")
+        log.info(f"✅ Hourly zone update sent | {len(merged)} zones")
 
     except Exception as e:
         log.error(f"Hourly job error: {e}")
