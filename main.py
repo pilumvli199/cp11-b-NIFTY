@@ -1643,16 +1643,29 @@ RETURN ONLY this JSON:
 # SECTION 6: SIGNAL ANALYTICS + EOD
 # ═══════════════════════════════════════════════════════
 
-def validate_decision(result, ltp, touched_zone=None):
+def validate_decision(result, ltp, touched_zone=None, event=""):
     """
     Basic validation — check confirmations.
-    FIX 16: added a hard Python-side LTP-vs-zone guard. Previously a
-    BUY_PE was sent at LTP 23947 right after a SUPPORT breakdown closed
-    at 23930 — but by the time the signal fired, LTP had already bounced
-    back above the zone's own low (23940), which is the actual
-    invalidation condition for that trade (confirmed by the AI's own
-    risk_note text contradicting its own signal). This guard catches
-    that case in code instead of relying on the AI to self-police it.
+    FIX 16 (corrected): hard Python-side guards against sending a signal
+    that's already self-invalidated by the time it fires.
+
+    Two separate checks, deliberately scoped differently:
+
+    1. ref_sl backstop (universal, any event) — if the AI's own ref_sl
+       has already been crossed by current LTP, the trade is already
+       invalidated by the AI's own stated level. Works for every event
+       type since ref_sl is signal-specific, not zone-direction-specific.
+
+    2. zone-boundary backstop (ONLY for break-continuation events:
+       BREAKOUT_CANDLE / BREAKDOWN_CANDLE / COMPRESSION_BREAKOUT /
+       COMPRESSION_BREAKDOWN) — for these, the trade thesis specifically
+       requires LTP to stay on the broken side of the zone. This must
+       NOT be applied to REJECTION/SWEEP/RETEST events, where LTP sitting
+       *inside* the zone is the normal, expected setup (that's literally
+       why the zone got touched and the AI call fired) — applying a
+       zone-boundary check there would incorrectly reject most valid
+       bounce-trade signals. This was a real bug in the first version of
+       this fix, caught on recheck before it ever shipped.
     """
     if not result:
         return False
@@ -1665,20 +1678,31 @@ def validate_decision(result, ltp, touched_zone=None):
     if sig == "WAIT":
         return True
 
-    if touched_zone:
+    ref    = result.get("reference", {})
+    ref_sl = ref.get("ref_sl", 0)
+
+    # 1. Universal ref_sl backstop
+    if ref_sl:
+        if sig == "BUY_CE" and ltp <= ref_sl:
+            log.info(f"Rejected: BUY_CE but LTP {ltp} already at/below its own ref_sl {ref_sl}")
+            return False
+        if sig == "BUY_PE" and ltp >= ref_sl:
+            log.info(f"Rejected: BUY_PE but LTP {ltp} already at/above its own ref_sl {ref_sl}")
+            return False
+
+    # 2. Zone-boundary backstop — break-continuation events ONLY
+    BREAK_CONTINUATION_EVENTS = {
+        "BREAKOUT_CANDLE", "COMPRESSION_BREAKOUT",
+        "BREAKDOWN_CANDLE", "COMPRESSION_BREAKDOWN"
+    }
+    if touched_zone and event in BREAK_CONTINUATION_EVENTS:
         zone_low  = touched_zone.get("low", 0)
         zone_high = touched_zone.get("high", 0)
-        # BUY_PE = betting on a SUPPORT breakdown continuing down.
-        # If LTP has already reclaimed back above the zone's low, the
-        # breakdown is already invalidated — don't send it.
         if sig == "BUY_PE" and ltp > zone_low:
-            log.info(f"Rejected: BUY_PE but LTP {ltp} already back above zone low {zone_low}")
+            log.info(f"Rejected: BUY_PE but LTP {ltp} already back above broken zone low {zone_low}")
             return False
-        # BUY_CE = betting on a RESISTANCE breakout continuing up.
-        # If LTP has already fallen back below the zone's high, the
-        # breakout is already invalidated.
         if sig == "BUY_CE" and ltp < zone_high:
-            log.info(f"Rejected: BUY_CE but LTP {ltp} already back below zone high {zone_high}")
+            log.info(f"Rejected: BUY_CE but LTP {ltp} already back below broken zone high {zone_high}")
             return False
 
     if conf == "LOW":
@@ -2049,7 +2073,7 @@ def zone_monitor_job():
         if not result:
             return
 
-        if not validate_decision(result, ltp, updated_zone):
+        if not validate_decision(result, ltp, updated_zone, event):
             log.info(f"⏭️ Signal rejected (low conf / weak confirmations): {zone_id} | {event}")
             save_signal_log({
                 "time":       now.strftime("%H:%M"),
