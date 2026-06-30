@@ -388,10 +388,23 @@ def _fmt_chg(past_data, key):
     return f"{val:+.1f}%" if val is not None else "N/A"
 
 
-def _vol_label(current_vol, baseline_vol):
-    if baseline_vol <= 0:
+def _vol_label(current_total, past_5min_total, baseline_total, elapsed_min):
+    """
+    FIX 15: Compare INCREMENTAL volume over the last 5min against the
+    day's average 5-min run-rate so far, instead of cumulative-day-volume
+    vs the single near-zero 9:20AM baseline snapshot. Upstox's option
+    chain `volume` field is the day's running total (confirmed via
+    Upstox docs) — a cumulative-vs-morning-baseline ratio grows just
+    from time passing, regardless of any real spike, so by midday it
+    always reads "HIGH" even with nothing unusual happening.
+    """
+    if past_5min_total is None or elapsed_min is None or elapsed_min <= 0:
         return "?"
-    r = current_vol / baseline_vol
+    incremental_5m = current_total - past_5min_total
+    avg_5m_rate    = (current_total - baseline_total) / (elapsed_min / 5)
+    if avg_5m_rate <= 0:
+        return "?"
+    r = incremental_5m / avg_5m_rate
     if r >= 2.0: return f"HIGH({r:.1f}x)"
     if r >= 1.0: return f"MED({r:.1f}x)"
     return f"LOW({r:.1f}x)"
@@ -407,9 +420,27 @@ def format_oi_context(current):
     if not current:
         return None
 
-    baseline     = _get("oi_baseline") or {}
-    base_ce_vol  = baseline.get("tot_ce_vol", 0)
-    base_pe_vol  = baseline.get("tot_pe_vol", 0)
+    baseline          = _get("oi_baseline") or {}
+    base_ce_vol       = baseline.get("tot_ce_vol", 0)
+    base_pe_vol       = baseline.get("tot_pe_vol", 0)
+    baseline_saved_at = baseline.get("saved_at")
+
+    # FIX 15: elapsed minutes since baseline — needed for the incremental
+    # volume comparison below. Floored at 5 to avoid a huge/undefined
+    # rate in the first few minutes after baseline is saved.
+    elapsed_min = None
+    if baseline_saved_at:
+        try:
+            bt = datetime.fromisoformat(baseline_saved_at)
+            if bt.tzinfo is None:
+                bt = IST.localize(bt)
+            elapsed_min = max(5, (datetime.now(IST) - bt).total_seconds() / 60)
+        except Exception:
+            elapsed_min = None
+
+    past5        = get_oi_snapshot(5)
+    past5_ce_vol = past5.get("tot_ce_vol") if past5 else None
+    past5_pe_vol = past5.get("tot_pe_vol") if past5 else None
 
     chg = {}
     for mins in [5, 15, 30]:
@@ -455,8 +486,9 @@ def format_oi_context(current):
         f"PE_OI_CHG:{pe_chg_str}\n"
         f"CE_WALL:{current['ce_wall']}({cw_oi//100000:.1f}L) "
         f"PE_WALL:{current['pe_wall']}({pw_oi//100000:.1f}L)\n"
-        f"CE_VOL:{_vol_label(current['tot_ce_vol'], base_ce_vol)} "
-        f"PE_VOL:{_vol_label(current['tot_pe_vol'], base_pe_vol)}"
+        f"CE_VOL:{_vol_label(current['tot_ce_vol'], past5_ce_vol, base_ce_vol, elapsed_min)} "
+        f"PE_VOL:{_vol_label(current['tot_pe_vol'], past5_pe_vol, base_pe_vol, elapsed_min)} "
+        f"(vs 5min-ago, relative to today's avg pace)"
     )
 
 
@@ -852,11 +884,23 @@ def detect_dominance_candle(df, ltp, lookback=DOMINANCE_LOOKBACK):
     }
 
 
+def _next_tick_boundary(dt, ticks_ahead=1):
+    """
+    FIX 14: Snap to the actual zone_monitor 5-min job grid (:00,:05,:10...
+    +10sec) instead of raw wall-clock + N minutes. Wall-clock cooldowns
+    drifted a few seconds off the grid and silently ate the very next
+    real tick (confirmed in logs: "7s left" / "12s left" skipping a
+    genuine confirmation candle). ticks_ahead counts in 5-min job ticks.
+    """
+    base = dt.replace(second=0, microsecond=0)
+    rem  = base.minute % 5
+    nxt  = base + timedelta(minutes=(5 - rem) if rem else 5)
+    nxt  = nxt + timedelta(minutes=5 * (ticks_ahead - 1), seconds=10)
+    return nxt
+
+
 def zone_cooldown_ok(zone_id):
-    """
-    Only block if same zone was just called in last 5 minutes.
-    Prevents duplicate calls on same candle only.
-    """
+    """Only block if cooldown is still active (tick-grid aligned — see mark_zone_cooldown)."""
     key = f"cooldown_{zone_id}"
     cd  = _get(key)
     if cd:
@@ -876,17 +920,23 @@ def zone_cooldown_ok(zone_id):
 
 def mark_zone_cooldown(zone_id, signal_type):
     """
-    BUY_CE/BUY_PE: 30min cooldown (trade active)
-    WAIT: 5min only (next candle can re-check)
+    BUY_CE/BUY_PE: ~30min cooldown (6 ticks), tick-grid aligned so drift
+    can't eat a real candle (FIX 14).
+    WAIT: NO cooldown anymore (FIX 14b) — the very next 5-min tick can
+    re-check the same zone immediately. Previously a flat 5min WAIT
+    cooldown was blocking the confirmation candle that often arrives
+    right after the first WAIT, which was the main cause of signals
+    landing 15-20min after the real move's origin instead of ~5-10min.
     """
     if signal_type in ["BUY_CE", "BUY_PE"]:
-        mins = 30
+        now   = datetime.now(IST)
+        until = _next_tick_boundary(now, ticks_ahead=6)
+        _set(f"cooldown_{zone_id}", {"until": until.isoformat()},
+             ttl=int((until - now).total_seconds()) + 120)
+        log.info(f"Zone {zone_id} cooldown: until {until.strftime('%H:%M:%S')} ({signal_type})")
     else:
-        mins = 5
-
-    until = (datetime.now(IST) + timedelta(minutes=mins)).isoformat()
-    _set(f"cooldown_{zone_id}", {"until": until}, ttl=mins*60+60)
-    log.info(f"Zone {zone_id} cooldown: {mins}min ({signal_type})")
+        _delete(f"cooldown_{zone_id}")
+        log.info(f"Zone {zone_id}: no cooldown (WAIT) — next tick can re-check")
 
 
 def merge_zones(existing, new_zones, ltp):
@@ -1062,18 +1112,23 @@ def detect_candle_event(tf_data, zone, ltp=0):
                 )
 
         # ── 3. BULLISH SWEEP RECLAIM ──────────────────────
+        # FIX 13: zone_type gated — was firing on SUPPORT zones too,
+        # mislabeling a normal support-bounce as a resistance-sweep event.
         if l < zone_low - 5 and c > zone_low:
-            return (
-                "BULLISH_SWEEP_RECLAIM",
-                f"wick swept to {l} below {zone_low}, reclaimed to {c}"
-            )
+            if zone_type in ["SUPPORT", "FLIP_SUPPORT", "LIQUIDITY"]:
+                return (
+                    "BULLISH_SWEEP_RECLAIM",
+                    f"wick swept to {l} below {zone_low}, reclaimed to {c}"
+                )
 
         # ── 4. BEARISH SWEEP REJECT ───────────────────────
+        # FIX 13: zone_type gated — mirror of above.
         if h > zone_high + 5 and c < zone_high:
-            return (
-                "BEARISH_SWEEP_REJECT",
-                f"wick swept to {h} above {zone_high}, rejected to {c}"
-            )
+            if zone_type in ["RESISTANCE", "FLIP_RESISTANCE", "LIQUIDITY"]:
+                return (
+                    "BEARISH_SWEEP_REJECT",
+                    f"wick swept to {h} above {zone_high}, rejected to {c}"
+                )
 
         # ── 5. COMPRESSION BREAKOUT / BREAKDOWN ───────────
         if len(m5) >= SIDEWAYS_CANDLE_CNT + 1:
@@ -1250,6 +1305,12 @@ SIGNAL RULES:
 - OI and price action BOTH confirm same direction = HIGH confidence
 - OI and price action CONFLICT = reduce confidence → lean toward WAIT
 - If OI shows N/A (no history yet) = ignore OI, use only price action
+- FIX 17: PCR is given as 30min→15min→now (oldest→newest). Weight the
+  MOST RECENT leg (15min→now) most heavily. If the most recent leg reverses
+  the earlier trend (e.g. was rising but the last step fell), treat this
+  as an early-reversal warning, not a continuation of the old trend —
+  describe it accurately as "reversing" rather than calling it "rising"
+  or "falling" based on the overall span.
 """
 
 # FIX 11: This module is now INJECTED CONDITIONALLY (only when Python's
@@ -1376,6 +1437,18 @@ REFERENCE LEVELS (for the "reference" field — analytics only, not advice):
   one), not an arbitrary point distance.
 - Briefly justify ref_sl/ref_target in terms of structure in your "reason"
   or "risk_note" if relevant.
+- CRITICAL: ref_sl is the ONE invalidation number for this trade. If you
+  mention an invalidation/cancel level anywhere in "reason", "risk_note",
+  or "message", it MUST be the exact same number as ref_sl — never a
+  second, different invalidation level. Before finalizing, check that any
+  signal you send is not ALREADY invalidated: if current LTP has already
+  crossed back past ref_sl (or past the touched zone's own boundary) by
+  the time you're writing this response, return WAIT instead of forcing
+  a signal that contradicts your own risk_note.
+- CRITICAL: All prices written in "reason", "risk_note", and "message"
+  must be real index prices (the same scale as the [CURRENT LTP] value
+  given to you), never the raw delta-encoded numbers from the candle
+  data blocks above. Convert before writing.
 
 RESPOND ONLY in valid JSON. No text outside JSON."""
 
@@ -1570,8 +1643,17 @@ RETURN ONLY this JSON:
 # SECTION 6: SIGNAL ANALYTICS + EOD
 # ═══════════════════════════════════════════════════════
 
-def validate_decision(result, ltp):
-    """Basic validation — check confirmations"""
+def validate_decision(result, ltp, touched_zone=None):
+    """
+    Basic validation — check confirmations.
+    FIX 16: added a hard Python-side LTP-vs-zone guard. Previously a
+    BUY_PE was sent at LTP 23947 right after a SUPPORT breakdown closed
+    at 23930 — but by the time the signal fired, LTP had already bounced
+    back above the zone's own low (23940), which is the actual
+    invalidation condition for that trade (confirmed by the AI's own
+    risk_note text contradicting its own signal). This guard catches
+    that case in code instead of relying on the AI to self-police it.
+    """
     if not result:
         return False
 
@@ -1582,6 +1664,22 @@ def validate_decision(result, ltp):
 
     if sig == "WAIT":
         return True
+
+    if touched_zone:
+        zone_low  = touched_zone.get("low", 0)
+        zone_high = touched_zone.get("high", 0)
+        # BUY_PE = betting on a SUPPORT breakdown continuing down.
+        # If LTP has already reclaimed back above the zone's low, the
+        # breakdown is already invalidated — don't send it.
+        if sig == "BUY_PE" and ltp > zone_low:
+            log.info(f"Rejected: BUY_PE but LTP {ltp} already back above zone low {zone_low}")
+            return False
+        # BUY_CE = betting on a RESISTANCE breakout continuing up.
+        # If LTP has already fallen back below the zone's high, the
+        # breakout is already invalidated.
+        if sig == "BUY_CE" and ltp < zone_high:
+            log.info(f"Rejected: BUY_CE but LTP {ltp} already back below zone high {zone_high}")
+            return False
 
     if conf == "LOW":
         log.info("Rejected: LOW confidence")
@@ -1790,6 +1888,7 @@ def morning_job():
         if ltp_now:
             baseline = fetch_oi_chain(ltp_now)
             if baseline:
+                baseline["saved_at"] = datetime.now(IST).isoformat()  # FIX 15
                 _set("oi_baseline", baseline, ttl=86400)
                 save_oi_snapshot(baseline)
                 log.info(f"✅ OI baseline saved | PCR:{baseline.get('pcr')} ATM:{baseline.get('atm')} Expiry:{baseline.get('expiry')}")
@@ -1950,7 +2049,7 @@ def zone_monitor_job():
         if not result:
             return
 
-        if not validate_decision(result, ltp):
+        if not validate_decision(result, ltp, updated_zone):
             log.info(f"⏭️ Signal rejected (low conf / weak confirmations): {zone_id} | {event}")
             save_signal_log({
                 "time":       now.strftime("%H:%M"),
